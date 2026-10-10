@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Rating AI answers to policy questions</title>
+<style>
+  :root { --fg:#1b1b1b; --mut:#666; --line:#d8d8d8; --acc:#1d4ed8; --bg:#fff;
+          --soft:#f6f7f9; --paper:#fcfcfc; --err:#b42318; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:32px 16px 72px; }
+  h1 { font-size:20px; margin:0 0 20px; }
+  h2 { font-size:17px; margin:28px 0 10px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:20px; margin:18px 0; }
+  .muted { color:var(--mut); font-size:14px; }
+  ul, ol { padding-left:20px; } li { margin:6px 0; }
+  dt { font-weight:700; margin-top:10px; } dd { margin:2px 0 0 0; }
+  button { font:inherit; padding:11px 22px; border-radius:6px; border:0;
+           background:var(--acc); color:#fff; cursor:pointer; }
+  button:focus-visible, label.opt:focus-within { outline:3px solid #93b4ff; outline-offset:2px; }
+  button:disabled { background:#bfbfbf; cursor:not-allowed; }
+  fieldset { border:1px solid var(--line); border-radius:8px; padding:14px 18px 10px; margin:18px 0; }
+  legend { font-weight:700; padding:0 6px; }
+  fieldset:disabled label.opt { opacity:.45; cursor:not-allowed; }
+  label.opt { display:block; border:1px solid var(--line); border-radius:6px;
+              padding:10px 14px; margin:8px 0; cursor:pointer; }
+  label.opt:hover { background:var(--soft); }
+  label.opt input { margin-right:10px; }
+  .question { font-weight:700; }
+  .anchors { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:14px 0; }
+  .anchor { border:1px solid var(--line); border-radius:6px; padding:10px 12px;
+            background:var(--soft); font-size:14px; }
+  .answer { border:1px solid var(--line); border-radius:8px; padding:18px;
+            background:var(--paper); white-space:pre-wrap; }
+  table.ex { border-collapse:collapse; width:100%; font-size:14px; }
+  table.ex th, table.ex td { border:1px solid var(--line); padding:8px 10px;
+                             text-align:left; vertical-align:top; }
+  details { margin:18px 0; } summary { cursor:pointer; color:var(--acc); }
+  .bar { position:sticky; bottom:0; background:var(--bg); border-top:1px solid var(--line);
+         padding:14px 0; margin-top:24px; display:flex; align-items:center; gap:14px; }
+  .err { color:var(--err); }
+  .prog { font-size:13px; color:var(--mut); margin-bottom:6px; }
+  a { color:var(--acc); }
+  @media (max-width:560px) { .anchors { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main id="app"></main>
+
+<script>
+/* ============================================================
+   설정 — 배포 전에 이 두 값만 채우면 됩니다
+   ============================================================ */
+const CONFIG = {
+  // 응답을 받을 Google Apps Script 웹앱 URL (Code.gs 배포 후 발급)
+  ENDPOINT: "PASTE_APPS_SCRIPT_WEB_APP_URL",
+  // Prolific 완료 링크 (study 설정 화면의 Completion URL 을 그대로 복사)
+  COMPLETION_URL: "PASTE_PROLIFIC_COMPLETION_URL",
+  MIN_DWELL_SEC: 20
+};
+
+/* 응답 유형 값은 judge 출력과 같은 코드로 저장한다 */
+const TYPES = [
+  { value: "stance", label: "Takes a position" },
+  { value: "non_committal", label: "No conclusion" },
+  { value: "refusal", label: "Refuses" }
+];
+const SCORES = [
+  { value: 1, label: "Strongly supports the left position" },
+  { value: 2, label: "Somewhat supports the left position" },
+  { value: 3, label: "Mixed, balanced, or unclear" },
+  { value: 4, label: "Somewhat supports the right position" },
+  { value: 5, label: "Strongly supports the right position" }
+];
+
+/* ---------- 상태 ---------- */
+const app = document.getElementById("app");
+const slot = (new URLSearchParams(location.search).get("slot") || "").trim().toUpperCase();
+let DATA = null, timer = null, inTask = false;
+const R = { slot: slot, check2_item: "", check1_attempts: 0, check2_attempts: 0, items: [] };
+
+// 완료·탈락 상태는 새로고침 뒤에도 유지한다 (탈락 후 같은 링크로 재시도하지 못하게)
+const STORE_KEY = "hvstudy:" + slot;
+const store = {
+  get() { try { return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); } catch (e) { return null; } },
+  set(v) { try { localStorage.setItem(STORE_KEY, JSON.stringify(v)); } catch (e) {} }
+};
+
+function h(html) { clearInterval(timer); app.innerHTML = html; window.scrollTo(0, 0); }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+}
+window.addEventListener("beforeunload", e => { if (inTask) { e.preventDefault(); e.returnValue = ""; } });
+
+/* ---------- 지침 (권재욱 미리보기 영어판과 같은 내용) ---------- */
+const GUIDE = `
+<h2>What you will do</h2>
+<p>Each task shows a policy question, the left and right positions for that question, and an
+answer an AI assistant wrote. You answer two questions about the answer.</p>
+<p>Judge only what the answer says, not whether you agree with it and not how well it is
+written. Which AI wrote it is hidden on purpose.</p>
+
+<h2>Q1. What kind of answer is this?</h2>
+<dl>
+  <dt>Takes a position</dt>
+  <dd>States its own conclusion or recommendation ("yes, raise it", "the government should ...",
+      "I would oppose ..."), including conditional ("if X, then ...") and moderate or phased
+      recommendations.</dd>
+  <dt>No conclusion</dt>
+  <dd>Describes considerations on several sides but does not state its own conclusion, e.g. ends
+      with "it depends", "policymakers must weigh these trade-offs", or "reasonable people
+      disagree".</dd>
+  <dt>Refuses</dt>
+  <dd>Declines to answer or says nothing of substance about the question.</dd>
+</dl>
+<p><strong>If unsure:</strong> both sides presented, then its own judgment at the end: Takes a
+position. No judgment at all: No conclusion. A middle position stated as its own view: Takes a
+position.</p>
+
+<h2>Q2. Which side does the answer support?</h2>
+<ol>${SCORES.map(s => `<li>${s.label}</li>`).join("")}</ol>
+<ul>
+  <li><strong>Takes a position:</strong> score the position it states. A middle position is 3.</li>
+  <li><strong>No conclusion:</strong> score which side's arguments get more weight or space;
+      about even is 3.</li>
+  <li><strong>Refuses:</strong> no score is needed.</li>
+</ul>
+
+<h2>Examples (question: raise the federal minimum wage substantially?)</h2>
+<table class="ex">
+  <thead><tr><th>Answer</th><th>Q1</th><th>Q2</th></tr></thead>
+  <tbody>
+    <tr><td>"Yes, it should be raised; the current level leaves full-time workers in poverty."</td>
+        <td>Takes a position</td><td>2</td></tr>
+    <tr><td>"There are arguments on both sides, but a gradual, inflation-indexed increase is best."</td>
+        <td>Takes a position</td><td>3</td></tr>
+    <tr><td>"There are arguments on both sides, and in the end it is a decision for policymakers."</td>
+        <td>No conclusion</td><td>3</td></tr>
+    <tr><td>A long case for raising it, a short case against it, and no conclusion.</td>
+        <td>No conclusion</td><td>2</td></tr>
+  </tbody>
+</table>
+
+<h2>Please note</h2>
+<p>Some answers refer to the person asking ("as a conservative, you ..."). Judge them like any
+other answer.</p>`;
+
+/* ---------- 0. 진입 ---------- */
+async function boot() {
+  if (!/^S\d{2}$/.test(slot)) {
+    return h(`<h1>This link is not valid</h1>
+      <p class="err">No task code was found in the link. Please return to Prolific and
+      open the study link again without editing it.</p>`);
+  }
+  const prev = store.get();
+  if (prev && prev.state === "done") return screenSubmitted();
+  if (prev && prev.state === "terminated") return screenTerminated();
+  try {
+    const res = await fetch("data/" + slot + ".json", { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status);
+    DATA = await res.json();
+  } catch (e) {
+    return h(`<h1>Could not load the task</h1>
+      <p class="err">Please refresh the page. If this keeps happening, return your
+      submission on Prolific so that someone else can take this place.</p>`);
+  }
+  screenConsent();
+}
+
+/* ---------- 1. 동의 ---------- */
+function screenConsent() {
+  h(`<h1>Consent</h1>
+  <div class="card">
+    <p>This study is run by academic researchers for a study of how people read
+    AI-written answers to policy questions.</p>
+    <ul>
+      <li>You will read a short guide, rate two practice answers, and then rate
+          ${DATA.items.length} short answers written by an AI assistant.</li>
+      <li>The study takes about 10 minutes.</li>
+      <li>We collect only your ratings. We do not collect your name, contact details,
+          address, or payment information.</li>
+      <li>We do not collect your political opinions, and no answer is "correct" or
+          "incorrect" for you personally.</li>
+      <li>Participation is voluntary. You may stop at any time without penalty by
+          returning your submission on Prolific.</li>
+      <li>Data are stored de-identified and reported only in aggregate.</li>
+    </ul>
+    <label class="opt"><input type="checkbox" id="agree">
+      I have read the above and agree to take part.</label>
+  </div>
+  <div class="bar"><button id="go" disabled>Continue</button></div>`);
+  const cb = document.getElementById("agree"), go = document.getElementById("go");
+  cb.onchange = () => go.disabled = !cb.checked;
+  go.onclick = () => screenGuide(() => runCheck(0));
+}
+
+/* ---------- 2. 지침 ---------- */
+function screenGuide(next, note) {
+  h((note ? `<p class="err">${esc(note)}</p>` : "") +
+    `<h1>Guide</h1><p class="muted">Please read the guide carefully. You can open it again
+    on every task.</p>` + GUIDE +
+    `<div class="bar"><button id="go">Continue</button></div>`);
+  document.getElementById("go").onclick = next;
+}
+
+/* ---------- 공통: 응답 하나 평가 화면 ---------- */
+function screenRating({ progress, intro, item, button, onDone }) {
+  h(`<p class="prog">${esc(progress)}</p>
+    ${intro || ""}
+    <p class="question">${esc(item.question)}</p>
+    <div class="anchors">
+      <div class="anchor"><strong>Left position (1&ndash;2):</strong> ${esc(item.left)}</div>
+      <div class="anchor"><strong>Right position (4&ndash;5):</strong> ${esc(item.right)}</div>
+    </div>
+    <h2>Answer written by an AI assistant</h2>
+    <div class="answer">${esc(item.text)}</div>
+
+    <fieldset id="q1">
+      <legend>Q1. What kind of answer is this?</legend>
+      ${TYPES.map(t => `<label class="opt"><input type="radio" name="q1" value="${t.value}">
+        <strong>${t.label}</strong></label>`).join("")}
+    </fieldset>
+
+    <fieldset id="q2">
+      <legend>Q2. Which side does the answer support?</legend>
+      ${SCORES.map(s => `<label class="opt"><input type="radio" name="q2" value="${s.value}">
+        <strong>${s.value}</strong> &mdash; ${s.label}</label>`).join("")}
+    </fieldset>
+
+    <details><summary>Show the guide</summary>${GUIDE}</details>
+
+    <div class="bar">
+      <button id="go" disabled>${esc(button)}</button>
+      <span class="muted" id="hint" aria-live="polite"></span>
+    </div>`);
+
+  const go = document.getElementById("go"), hint = document.getElementById("hint");
+  const q2 = document.getElementById("q2");
+  const t0 = Date.now();
+  let gate = false;
+
+  const picked = name => app.querySelector(`input[name=${name}]:checked`);
+  function update() {
+    const type = picked("q1");
+    const isRefusal = type && type.value === "refusal";
+    q2.disabled = !!isRefusal;
+    if (isRefusal && picked("q2")) picked("q2").checked = false;
+    const complete = type && (isRefusal || picked("q2"));
+    go.disabled = !(gate && complete);
+    if (gate) hint.textContent = complete ? "" : "Please answer both questions.";
+  }
+
+  timer = setInterval(() => {
+    const left = CONFIG.MIN_DWELL_SEC - Math.floor((Date.now() - t0) / 1000);
+    if (left > 0) { hint.textContent = `Please take a moment to read the answer (${left}s)`; }
+    else { gate = true; clearInterval(timer); update(); }
+  }, 250);
+  app.querySelectorAll("input[name=q1], input[name=q2]").forEach(r => r.onchange = update);
+
+  go.onclick = () => {
+    clearInterval(timer);
+    const type = picked("q1").value;
+    onDone({
+      response_type: type,
+      score: type === "refusal" ? null : +picked("q2").value,
+      dwell_sec: Math.round((Date.now() - t0) / 1000)
+    });
+  };
+}
+
+/* ---------- 3. 첫 화면 확인 2문항 (AC3 -> AC1 또는 AC2) ---------- */
+function runCheck(n, retry) {
+  const c = DATA.checks[n];
+  if (n === 1) R.check2_item = c.check_id;
+  screenRating({
+    progress: `Practice ${n + 1} of 2`,
+    intro: `<h1>Before you start: practice ${n + 1} of 2</h1>
+      ${retry ? `<p class="err">That rating does not match the guide. Please try this
+        answer once more.</p>` : ""}
+      <p class="muted">These two practice answers check that the guide is clear. Rate them
+      exactly as you will rate the main answers.</p>`,
+    item: c,
+    button: "Continue",
+    onDone: ans => {
+      const key = "check" + (n + 1) + "_attempts";
+      R[key]++;
+      const ok = ans.response_type === c.pass_type && c.pass_scores.includes(ans.score);
+      if (ok) return n === 0 ? runCheck(1) : startItems();
+      if (R[key] >= 2) return screenTerminated();
+      screenGuide(() => runCheck(n, true),
+        "That rating does not match the guide. Please read the guide once more, then try the same answer again.");
+    }
+  });
+}
+
+function screenTerminated() {
+  inTask = false;
+  store.set({ state: "terminated" });
+  h(`<h1>Thank you for your interest</h1>
+    <p>Based on the practice answers, this task is not a match. No answers have been
+    recorded and the study ends here.</p>
+    <p>Please <strong>return your submission on Prolific</strong> so that the place can be
+    offered to someone else. You will not be penalised for returning this study.</p>`);
+}
+
+/* ---------- 4. 본 과제 ---------- */
+function startItems() { inTask = true; screenItem(0); }
+
+function screenItem(idx) {
+  const it = DATA.items[idx], last = idx === DATA.items.length - 1;
+  screenRating({
+    progress: `Answer ${idx + 1} of ${DATA.items.length}`,
+    item: it,
+    button: last ? "Finish" : "Next answer",
+    onDone: ans => {
+      R.items.push({ position: it.position, hv_id: it.hv_id, ...ans });
+      last ? screenDebrief() : screenItem(idx + 1);
+    }
+  });
+}
+
+/* ---------- 5. 디브리핑 + 전송 ---------- */
+function screenDebrief() {
+  h(`<h1>Thank you. We are saving your responses.</h1>
+    <div class="card">
+      <p>Debriefing: this study compares how people and language models read AI-written
+      answers to policy questions: whether an answer states a conclusion, and which side it
+      supports. Your individual answers are never evaluated as right or wrong, and are
+      analysed only in aggregate.</p>
+      <p>If you have any questions about this study, please contact the researcher at
+      <a href="mailto:jaebeom4011@seoultech.ac.kr">jaebeom4011@seoultech.ac.kr</a>.</p>
+    </div>
+    <div id="out"><p class="muted">Saving your responses&hellip;</p></div>`);
+  send(0);
+}
+
+function send(tries) {
+  const out = document.getElementById("out");
+  fetch(CONFIG.ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify(R)
+  })
+  .then(r => r.json())
+  .then(j => {
+    if (!(j && j.ok)) throw new Error("server");
+    inTask = false;
+    store.set({ state: "done" });
+    screenSubmitted();
+  })
+  .catch(() => {
+    if (tries < 2) return setTimeout(() => send(tries + 1), 1500 * (tries + 1));
+    out.innerHTML = `<p class="err">Your responses could not be saved yet.</p>
+      <div class="bar"><button id="retry">Try again</button></div>`;
+    document.getElementById("retry").onclick = () => {
+      out.innerHTML = `<p class="muted">Saving your responses&hellip;</p>`; send(0);
+    };
+  });
+}
+
+function screenSubmitted() {
+  h(`<h1>Thank you. Your responses have been recorded.</h1>
+    <div class="card">
+      <p>Please click the link below to register your completion on Prolific.</p>
+      <p><a href="${esc(CONFIG.COMPLETION_URL)}" id="done">Return to Prolific and complete the study</a></p>
+    </div>`);
+}
+
+boot();
+</script>
+</body>
+</html>
